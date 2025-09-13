@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Adaptive Learning Manager — Mallareddy</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React + ReactDOM -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <!-- Babel (JSX in page) -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- PDF.js for client-side PDF text extraction -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.13.216/pdf.min.js"></script>
+  <!-- Chart.js for analytics -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    /* small extra styles */
+    .card-glow { box-shadow: 0 12px 40px rgba(99,102,241,0.12); }
+    .pulse { animation: pulse 2.5s infinite; }
+    @keyframes pulse { 0%{ box-shadow:0 0 0 rgba(99,102,241,0.06)} 70%{ box-shadow:0 0 30px rgba(99,102,241,0.04)} 100%{box-shadow:0 0 0 rgba(99,102,241,0)} }
+    .question-correct { background: #d1fae5; }
+    .question-wrong { background: #fee2e2; }
+  </style>
+</head>
+<body class="bg-gradient-to-br from-indigo-50 via-white to-pink-50 text-gray-800">
+  <div id="root"></div>
+
+  <script type="text/babel">
+  const { useState, useEffect, useRef } = React;
+
+  /************************************************************************
+   Adaptive Learning Management System (Single-file demo)
+   - Upload PDF or paste text -> extracts content (PDF.js)
+   - Generates assessments automatically (MCQ, True/False, Short Answer) using simple heuristics
+   - Tracks performance and displays analytics (Chart.js)
+   - Gives personalized study recommendations based on weak topics
+   - Colorful, responsive UI with lively images
+   Notes:
+     - This is a front-end demo. For production, replace the simple heuristics with an LLM/NLP backend
+       (OpenAI/TensorFlow.js/etc.) to get high-quality question generation and better topic extraction.
+  ************************************************************************/
+
+  // ---------- Helper utilities ----------
+  function uid(prefix = '') { return prefix + Math.random().toString(36).slice(2,9); }
+
+  // Very simple sentence splitter
+  function splitSentences(text) {
+    return text
+      .replace(/\r\n/g,' ')
+      .replace(/\n/g,' ')
+      .split(/(?<=[.?!])\s+(?=[A-Z0-9])/)
+      .map(s=>s.trim())
+      .filter(Boolean);
+  }
+
+  // Basic keyword extractor: pick frequent non-stopwords
+  const STOPWORDS = new Set(("a,an,the,and,or,for,of,to,in,on,with,by,from,that,which,is,are,was,were,be,as,at,this,these,those,has,have,it,its").split(","));
+  function extractKeywords(text, limit = 12) {
+    const words = text.toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(Boolean);
+    const freq = {};
+    for (const w of words) {
+      if (w.length <= 3) continue;
+      if (STOPWORDS.has(w)) continue;
+      freq[w] = (freq[w]||0) + 1;
+    }
+    return Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,limit).map(x=>x[0]);
+  }
+
+  // Pick a mask word from a sentence: prefer multi-char noun-like token (heuristic)
+  function pickMaskWord(sentence, keywords) {
+    const tokens = sentence.split(/\s+/).map(t=>t.replace(/[^a-zA-Z0-9\-]/g,''));
+    // prefer keywords present
+    for (const k of keywords) {
+      for (const t of tokens) if (t.toLowerCase().includes(k)) return t;
+    }
+    // fallback: longest token
+    let best = tokens.sort((a,b)=>b.length-a.length)[0] || '';
+    if (best.length < 4) return null;
+    return best;
+  }
+
+  // Generate MCQ from sentence
+  function makeMCQ(sentence, keywords, allKeywordsPool) {
+    const mask = pickMaskWord(sentence, keywords);
+    if (!mask) return null;
+    const blank = '____';
+    const question = sentence.replace(new RegExp(mask, 'g'), blank);
+    const correct = mask;
+    // generate distractors from keyword pool or from variations
+    const pool = allKeywordsPool.filter(k => k.toLowerCase() !== correct.toLowerCase());
+    // pick up to 3 distractors
+    const distractors = [];
+    for (let i=0;i<pool.length && distractors.length<3;i++){
+      const cand = pool[i];
+      if (cand && !distractors.includes(cand)) distractors.push(cand);
+    }
+    // if not enough, fabricate near-miss distractors (char shuffles)
+    while (distractors.length < 3) {
+      const s = correct.split('').sort(()=>Math.random()-0.5).join('');
+      if (!distractors.includes(s) && s.toLowerCase() !== correct.toLowerCase()) distractors.push(s.substr(0, Math.min(8,s.length)));
+    }
+    const options = [correct, ...distractors].sort(()=>Math.random()-0.5);
+    return { type: 'mcq', question, options, answer: correct, originSentence:sentence };
+  }
+
+  // Generate True/False question: take a factual sentence, sometimes negate
+  function makeTF(sentence) {
+    // avoid questions that are too short
+    if (sentence.split(' ').length < 6) return null;
+    // decide truth or false (flip a simple numeric or boolean phrase if possible)
+    const isTrue = Math.random() > 0.35;
+    let question = sentence;
+    if (!isTrue) {
+      // naive negation: insert "not" after first verb-like word (heuristic)
+      question = sentence.replace(/\b(is|are|was|were|has|have|can|will)\b/i, (m)=> m + ' not') ;
+      // if couldn't negate, prefix "It is false that ..."
+      if (question === sentence) question = 'It is false that ' + sentence[0].toLowerCase() + sentence.slice(1);
+    }
+    return { type: 'tf', question, answer: isTrue ? 'True' : 'False', originSentence:sentence };
+  }
+
+  // Short answer: ask to recall a phrase (substring)
+  function makeShort(sentence, keywords) {
+    const mask = pickMaskWord(sentence, keywords);
+    if (!mask) return null;
+    const question = `In the sentence: "${sentence}", what word fits the blank: ____ ?`;
+    return { type: 'short', question, answer: mask, originSentence: sentence };
+  }
+
+  // Simple storage (localStorage)
+  const STORAGE_KEY = 'mru_adaptive_learning_v1';
+  function loadAppState() {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return { docs: [], questions: [], attempts: [], profiles: {} };
+    try { return JSON.parse(raw); } catch { return { docs: [], questions: [], attempts: [], profiles: {} }; }
+  }
+  function saveAppState(state) { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
+
+  // ---------- Main App ----------
+  function App(){
+    const [state, setState] = useState(()=> loadAppState());
+    const [docText, setDocText] = useState('');          // extracted content of current doc
+    const [docTitle, setDocTitle] = useState('');
+    const [keywords, setKeywords] = useState([]);
+    const [questions, setQuestions] = useState(state.questions || []);
+    const [attempts, setAttempts] = useState(state.attempts || []);
+    const [selectedDocIndex, setSelectedDocIndex] = useState(null);
+    const [activeQuestionIndex, setActiveQuestionIndex] = useState(0);
+    const [userAnswers, setUserAnswers] = useState({});
+    const [message, setMessage] = useState('');
+    const fileRef = useRef(null);
+
+    useEffect(()=> {
+      // persist whenever questions/attempts/docs change
+      const newState = {...state, questions, attempts, docs: state.docs};
+      saveAppState(newState);
+      setState(newState);
+    }, [questions, attempts]);
+
+    // ---------- Document processing (PDF & text) ----------
+    async function handleFile(e) {
+      const f = e.target.files[0];
+      if (!f) return;
+      setMessage('Processing document — extracting text...');
+      setDocTitle(f.name);
+      if (f.type === 'application/pdf') {
+        // use pdf.js
+        const arrayBuffer = await f.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        let fullText = '';
+        for (let p=1; p<=pdf.numPages; p++){
+          const page = await pdf.getPage(p);
+          const txtContent = await page.getTextContent();
+          const pageText = txtContent.items.map(it=>it.str).join(' ');
+          fullText += '\n' + pageText;
+        }
+        setDocText(fullText);
+        postProcessDoc(fullText, f.name);
+      } else {
+        // try reading as text
+        const txt = await f.text();
+        setDocText(txt);
+        postProcessDoc(txt, f.name);
+      }
+      setMessage('');
+      fileRef.current.value = '';
+    }
+
+    function handlePasteText() {
+      const t = document.getElementById('pasteInput').value;
+      if (!t.trim()) { setMessage('Please paste some text.'); return; }
+      setDocTitle('Pasted Document');
+      setDocText(t);
+      postProcessDoc(t, 'Pasted Document');
+      document.getElementById('pasteInput').value = '';
+    }
+
+    function postProcessDoc(text, title='Document') {
+      // store doc
+      const doc = { id: uid('doc_'), title, text, uploadedAt: new Date().toISOString() };
+      const docs = [...(state.docs||[]), doc];
+      const newState = {...state, docs};
+      setState(newState);
+      saveAppState(newState);
+      setSelectedDocIndex(docs.length - 1);
+
+      // extract keywords
+      const keys = extractKeywords(text, 20);
+      setKeywords(keys);
+
+      // auto-generate questions
+      const sents = splitSentences(text).filter(s=>s.length>30);
+      const poolKeywords = keys.length ? keys : text.split(/\s+/).slice(0,200);
+      const generated = [];
+      // heuristics: generate MCQ from sentences containing keywords, some TFs and shorts
+      for (let i=0;i<Math.min(50,sents.length);i++){
+        const s = sents[i];
+        // produce an MCQ if has candidate
+        const mcq = makeMCQ(s, keys, poolKeywords);
+        if (mcq) generated.push(mcq);
+        // produce a TF occasionally
+        if (i % 6 === 0) {
+          const tf = makeTF(s);
+          if (tf) generated.push(tf);
+        }
+        // short answer occasionally
+        if (i % 8 === 0) {
+          const short = makeShort(s, keys);
+          if (short) generated.push(short);
+        }
+      }
+      // merge into app questions
+      const qs = [...questions, ...generated].slice(0,200); // cap
+      setQuestions(qs);
+      setMessage(`Document processed. Extracted ${keys.length} keywords and generated ${generated.length} questions.`);
+    }
+
+    // ---------- Question attempt handling ----------
+    function submitAnswer(qIndex, answer) {
+      const q = questions[qIndex];
+      if (!q) return;
+      const correct = (q.type === 'mcq' || q.type === 'short') ? (answer && answer.toString().trim().toLowerCase() === q.answer.toString().trim().toLowerCase()) : (answer === q.answer || (typeof answer === 'string' && answer.toLowerCase() === q.answer.toLowerCase()));
+      const attempt = {
+        id: uid('att_'),
+        qIndex,
+        questionType: q.type,
+        selected: answer,
+        correct,
+        timestamp: new Date().toISOString(),
+        docId: state.docs[selectedDocIndex]?.id || null
+      };
+      const newAttempts = [...attempts, attempt];
+      setAttempts(newAttempts);
+      setUserAnswers({...userAnswers, [qIndex]: answer});
+      setMessage(correct ? 'Correct ✅' : `Incorrect — correct: ${q.answer}`);
+      // move to next question
+      setActiveQuestionIndex(Math.min(questions.length-1, activeQuestionIndex+1));
+    }
+
+    // ---------- Analytics ----------
+    function computeAnalytics() {
+      const total = attempts.length;
+      const correct = attempts.filter(a=>a.correct).length;
+      const accuracy = total ? Math.round((correct/total)*100) : 0;
+      // performance by type
+      const byType = {};
+      for (const a of attempts) {
+        byType[a.questionType] = byType[a.questionType] || {total:0, correct:0};
+        byType[a.questionType].total++;
+        if (a.correct) byType[a.questionType].correct++;
+      }
+      const typeStats = Object.entries(byType).map(([t, v]) => ({ type: t, total: v.total, correct: v.correct, accuracy: v.total ? Math.round((v.correct/v.total)*100) : 0 }));
+      // weak topics heuristic: find keywords that appear in questions user got wrong
+      const wrongQuestions = attempts.filter(a=>!a.correct).map(a => questions[a.qIndex]);
+      const wrongText = wrongQuestions.map(q=>q.originSentence).join(' ');
+      const weakKeys = extractKeywords(wrongText, 6);
+      return { total, correct, accuracy, typeStats, weakKeys };
+    }
+
+    // ---------- Personalized recommendations ----------
+    function recommendations() {
+      const analytics = computeAnalytics();
+      const recs = [];
+      if (analytics.accuracy < 60) recs.push('Focus on core concepts: review highlighted sections and retake short quizzes.');
+      if (analytics.weakKeys && analytics.weakKeys.length) {
+        recs.push(`You struggled with: ${analytics.weakKeys.join(', ')} — revisit these sections.`);
+      } else {
+        recs.push('Great job — try advanced questions or upload another chapter.');
+      }
+      // also suggest resource links (placeholder)
+      recs.push('Suggested activity: 15-min focused reading on weak keywords + 5 practice MCQs.');
+      return recs;
+    }
+
+    // ---------- Download / Export ----------
+    function exportProgress() {
+      const data = { questions, attempts, docs: state.docs };
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'mru_learning_export.json';
+      a.click();
+    }
+
+    // ---------- Clear data ----------
+    function clearAll() {
+      if (!confirm('Clear all locally stored data?')) return;
+      localStorage.removeItem(STORAGE_KEY);
+      location.reload();
+    }
+
+    // ---------- Charts (Chart.js) ----------
+    const chartRef = useRef(null);
+    useEffect(()=> {
+      // render attempts-over-time chart
+      const ctx = chartRef.current && chartRef.current.getContext('2d');
+      if (!ctx) return;
+      const agg = {};
+      for (const a of attempts) {
+        const day = (new Date(a.timestamp)).toISOString().slice(0,10);
+        agg[day] = agg[day] || {total:0, correct:0};
+        agg[day].total++;
+        if (a.correct) agg[day].correct++;
+      }
+      const labels = Object.keys(agg).sort();
+      const totalData = labels.map(d=>agg[d].total);
+      const correctData = labels.map(d=>agg[d].correct);
+      // destroy old if exists
+      if (window._learningChart) window._learningChart.destroy();
+      window._learningChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [
+            { label: 'Correct', data: correctData, backgroundColor: '#10B981' },
+            { label: 'Attempts', data: totalData, backgroundColor: '#6366F188' }
+          ]
+        },
+        options: { responsive: true, interaction:{mode:'index'}, plugins:{legend:{position:'bottom'}} }
+      });
+    }, [attempts]);
+
+    // ---------- UI render ----------
+    const analytics = computeAnalytics();
+    const recs = recommendations();
+
+    return (
+      <div className="max-w-7xl mx-auto p-6">
+        {/* Header */}
+        <header className="flex items-center justify-between mb-6">
+          <div className="flex items-center gap-4">
+            <div className="bg-gradient-to-br from-indigo-600 to-pink-500 text-white w-14 h-14 rounded-2xl flex items-center justify-center text-2xl font-bold shadow-lg">MRU</div>
+            <div>
+              <h1 className="text-2xl font-extrabold">Adaptive Learning Manager — Mallareddy</h1>
+              <p className="text-sm text-gray-600">Upload materials, auto-generate assessments, track progress, and get personalised study advice.</p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <button onClick={exportProgress} className="px-3 py-2 bg-indigo-600 text-white rounded-lg">Export</button>
+            <button onClick={clearAll} className="px-3 py-2 border rounded-lg">Reset</button>
+          </div>
+        </header>
+
+        {/* Top panels: Upload & Quick stats */}
+        <section className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+          <div className="lg:col-span-2 bg-white rounded-2xl p-6 card-glow">
+            <div className="flex gap-6 items-center">
+              <div>
+                <h2 className="text-xl font-semibold">1. Upload Document (PDF / TXT) or Paste Text</h2>
+                <p className="text-sm text-gray-600">We extract content and auto-generate practice questions.</p>
+
+                <div className="mt-4 flex gap-3 items-center">
+                  <input ref={fileRef} type="file" accept=".pdf,.txt" onChange={handleFile} className="border rounded px-3 py-2"/>
+                  <button onClick={()=>document.getElementById('pasteBox').classList.toggle('hidden')} className="px-3 py-2 bg-pink-500 text-white rounded">Paste Text</button>
+                </div>
+
+                <div id="pasteBox" className="hidden mt-4">
+                  <textarea id="pasteInput" placeholder="Paste chapter or lecture notes here..." className="w-full border rounded p-3 h-28"></textarea>
+                  <div className="mt-2 flex gap-2">
+                    <button onClick={handlePasteText} className="px-3 py-2 bg-indigo-600 text-white rounded">Process Text</button>
+                  </div>
+                </div>
+
+                <div className="mt-4 text-sm text-gray-500">{message}</div>
+              </div>
+
+              <div className="w-48 h-36 bg-cover rounded-xl shadow-lg" style={{backgroundImage: `url('https://images.unsplash.com/photo-1521670867069-9e8b8b3b8b60?auto=format&fit=crop&w=1200&q=80')`}}></div>
+            </div>
+          </div>
+
+          <aside className="bg-white rounded-2xl p-4 card-glow">
+            <h3 className="font-semibold mb-3">Performance Summary</h3>
+            <div className="space-y-3">
+              <div className="text-sm text-gray-500">Attempts</div>
+              <div className="text-2xl font-bold">{analytics.total}</div>
+
+              <div className="text-sm text-gray-500 mt-2">Accuracy</div>
+              <div className="text-2xl font-bold">{analytics.accuracy}%</div>
+
+              <div className="mt-4">
+                <h4 className="text-sm font-medium text-gray-600">Quick Recommendations</h4>
+                <ul className="text-sm mt-2 space-y-1 text-gray-700">
+                  {recs.map((r,i)=>(<li key={i}>• {r}</li>))}
+                </ul>
+              </div>
+            </div>
+          </aside>
+        </section>
+
+        {/* Questions + Analytics */}
+        <section className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <div className="lg:col-span-2 space-y-6">
+            <div className="bg-white rounded-2xl p-6 card-glow">
+              <div className="flex items-center justify-between">
+                <h3 className="text-lg font-semibold">Generated Assessment</h3>
+                <div className="text-sm text-gray-500">Questions: {questions.length}</div>
+              </div>
+
+              {questions.length === 0 ? (
+                <div className="mt-6 text-gray-500">No questions yet — upload a document to generate assessments automatically.</div>
+              ) : (
+                <div className="mt-4 space-y-4">
+                  {questions.slice(activeQuestionIndex, activeQuestionIndex+6).map((q, i) => {
+                    const globalIndex = activeQuestionIndex + i;
+                    const ua = userAnswers[globalIndex];
+                    const attempt = attempts.find(a=>a.qIndex === globalIndex && a.docId === state.docs[selectedDocIndex]?.id);
+                    return (
+                      <div key={globalIndex} className={`p-4 rounded border ${attempt ? (attempt.correct ? 'question-correct' : 'question-wrong') : ''}`}>
+                        <div className="text-sm text-gray-600 mb-2">#{globalIndex+1} • {q.type.toUpperCase()}</div>
+                        <div className="mb-3 font-medium">{q.question}</div>
+                        {q.type === 'mcq' ? (
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                            {q.options.map((opt, oi)=>(
+                              <button key={oi} onClick={()=>submitAnswer(globalIndex, opt)} className="text-left px-3 py-2 border rounded hover:bg-indigo-50">{opt}</button>
+                            ))}
+                          </div>
+                        ) : q.type === 'tf' ? (
+                          <div className="flex gap-2">
+                            <button onClick={()=>submitAnswer(globalIndex, 'True')} className="px-3 py-2 border rounded">True</button>
+                            <button onClick={()=>submitAnswer(globalIndex, 'False')} className="px-3 py-2 border rounded">False</button>
+                          </div>
+                        ) : (
+                          <div className="flex gap-2">
+                            <input type="text" placeholder="Type answer..." value={ua || ''} onChange={(e)=>setUserAnswers({...userAnswers, [globalIndex]: e.target.value})} className="border rounded px-3 py-2 flex-1"/>
+                            <button onClick={()=>submitAnswer(globalIndex, userAnswers[globalIndex] || '')} className="px-3 py-2 bg-indigo-600 text-white rounded">Submit</button>
+                          </div>
+                        )}
+                        {attempt && (
+                          <div className="text-xs text-gray-600 mt-2">Attempted: {attempt.selected} — {attempt.correct ? 'Correct' : `Wrong (Ans: ${q.answer})`}</div>
+                        )}
+                      </div>
+                    );
+                  })}
+
+                  <div className="mt-4 flex gap-2">
+                    <button onClick={()=>setActiveQuestionIndex(Math.max(0, activeQuestionIndex-6))} className="px-3 py-2 border rounded">← Prev</button>
+                    <button onClick={()=>setActiveQuestionIndex(Math.min(Math.max(0, questions.length-6), activeQuestionIndex+6))} className="px-3 py-2 border rounded">Next →</button>
+                    <div className="ml-auto text-sm text-gray-500">Showing {Math.min(questions.length, activeQuestionIndex+1)}–{Math.min(questions.length, activeQuestionIndex+6)} of {questions.length}</div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="bg-white rounded-2xl p-6 card-glow">
+              <h3 className="text-lg font-semibold mb-3">Topic Keywords</h3>
+              <div className="flex flex-wrap gap-2">
+                {keywords.length ? keywords.map((k,i)=>(<span key={i} className="px-3 py-1 bg-indigo-50 text-indigo-700 rounded-full text-sm">{k}</span>)) : <div className="text-gray-500">No keywords yet — upload a document.</div>}
+              </div>
+            </div>
+          </div>
+
+          {/* Right column: analytics & charts */}
+          <aside className="space-y-6">
+            <div className="bg-white p-4 rounded-2xl card-glow">
+              <h4 className="font-semibold mb-2">Attempts Over Time</h4>
+              <canvas ref={chartRef} height="160"></canvas>
+            </div>
+
+            <div className="bg-white p-4 rounded-2xl card-glow">
+              <h4 className="font-semibold mb-2">Performance by Question Type</h4>
+              <div className="text-sm text-gray-600">
+                {analytics.typeStats.length ? analytics.typeStats.map((t,i)=>(
+                  <div key={i} className="mb-2">
+                    <div className="flex justify-between"><div>{t.type}</div><div>{t.accuracy}%</div></div>
+                    <div className="w-full bg-gray-100 h-2 rounded mt-1"><div style={{width: `${t.accuracy}%`}} className="h-2 bg-indigo-500 rounded"></div></div>
+                  </div>
+                )) : <div className="text-gray-500">No attempts yet</div>}
+              </div>
+            </div>
+
+            <div className="bg-white p-4 rounded-2xl card-glow">
+              <h4 className="font-semibold mb-2">Personalised Recommendations</h4>
+              <ul className="text-sm text-gray-700 space-y-2">
+                {recs.map((r,i)=>(<li key={i}>• {r}</li>))}
+              </ul>
+            </div>
+          </aside>
+        </section>
+
+        {/* Footer */}
+        <footer className="mt-8 text-center text-gray-600 text-sm">
+          Built-in demo — for production: integrate a backend NLP/LLM for higher-quality question generation and server-side analytics.
+        </footer>
+      </div>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+  </script>
+</body>
+</html>
